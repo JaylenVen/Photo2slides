@@ -1,0 +1,24 @@
+# Local secrets. API keys must be injected by the backend process environment.
+.env
+.env.*
+**/.env
+**/.env.*
+*.pem
+*.p12
+*.key
+
+# Generated data and caches.
+**/__pycache__/
+**/.pytest_cache/
+.tools/
+p2p/data/
+p2p/src/node_modules/
+
+# Training workspace: datasets, annotations, runs and base weights stay local.
+yolo26/
+
+# Model artifacts are ignored except for the inference weight shipped with the app.
+*.pt
+*.onnx
+*.engine
+!p2p/models/slide-seg.pt

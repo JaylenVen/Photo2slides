@@ -1,0 +1,8 @@
+{
+  "name": "photo2slide-pptx-writer",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "pptxgenjs": "^4.0.1"
+  }
+}

@@ -1,0 +1,5 @@
+numpy>=1.26,<2
+opencv-python>=4.10,<5
+ultralytics>=8.4,<9
+paddleocr>=2.10,<4
+wordninja==2.0.0

@@ -1,0 +1,13 @@
+data/
+src/node_modules/
+src/__pycache__/
+tests/__pycache__/
+.env
+.env.*
+*.pem
+*.p12
+*.key
+*.pt
+*.onnx
+*.engine
+!models/slide-seg.pt
