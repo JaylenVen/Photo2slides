@@ -1,9 +1,0 @@
--r requirements.txt
-
-# PaddleOCR-VL uses the official Transformers engine in the default workflow.
-# PaddlePaddle is not imported by that path.
-paddleocr[doc-parser]>=3.6,<3.7
-torch>=2.7,<3
-torchvision>=0.22,<1
-transformers>=5.10,<6
-safetensors>=0.8

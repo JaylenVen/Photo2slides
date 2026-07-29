@@ -10,12 +10,12 @@
 # Generated data and caches.
 **/__pycache__/
 **/.pytest_cache/
-.tools/
 p2p/data/
 p2p/src/node_modules/
+p2p/tests/
 
 # Training workspace: datasets, annotations, runs and base weights stay local.
-yolo26/
+p2p/training/
 
 # Model artifacts are ignored except for the inference weight shipped with the app.
 *.pt

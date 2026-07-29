@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import cv2
 import numpy as np
 
-from editable_pptx import build_editable_pptx
+from editable_pptx import DEFAULT_OPENAI_VISION_MODEL, build_editable_pptx
 from image_enhancement import (
     enhance_slide_image,
     prepare_ocr_image,
@@ -25,10 +25,12 @@ if TYPE_CHECKING:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_ROOT = PROJECT_ROOT / "data"
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "slide-seg.pt"
-DEFAULT_INPUT_DIR = PROJECT_ROOT / "data" / "input"
-DEFAULT_WORK_DIR = PROJECT_ROOT / "data" / "work" / "latest"
-DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "data" / "output" / "photo2slide-vlm.pptx"
+DEFAULT_INPUT_DIR = DATA_ROOT / "input"
+DEFAULT_INTERMEDIATE_DIR = DATA_ROOT / "intermediate"
+DEFAULT_WORK_DIR = DEFAULT_INTERMEDIATE_DIR / "runs" / "latest"
+DEFAULT_OUTPUT_PATH = DATA_ROOT / "final" / "photo2slide-vlm.pptx"
 
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 MASK_COLOR = np.array([0, 80, 0], dtype=np.uint8)
@@ -224,7 +226,7 @@ def _vlm_subprocess_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment.setdefault(
         "PADDLE_PDX_CACHE_HOME",
-        str((PROJECT_ROOT / "data" / "cache" / "paddlex").resolve()),
+        str((DEFAULT_INTERMEDIATE_DIR / "cache" / "paddlex").resolve()),
     )
     environment.setdefault("PADDLE_PDX_MODEL_SOURCE", "modelscope")
     environment.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
@@ -245,7 +247,7 @@ def _build_pptx_with_vlm_subprocess(
     reconstruction_dir = (
         work_dir.expanduser().resolve()
         if work_dir is not None
-        else output_path.parent / "intermediate" / "reconstruction"
+        else DEFAULT_WORK_DIR / "reconstruction"
     )
     worker = Path(__file__).with_name("vlm_reconstruct.py")
     command = [
@@ -346,6 +348,7 @@ def build_pptx(
     ocr_device: str = "auto",
     ocr_confidence: float = 0.78,
     font_name: str = "Microsoft YaHei",
+    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
     work_dir: Path | None = None,
 ) -> Path:
     sorted_paths = sorted(image_paths, key=natural_sort_key)
@@ -368,6 +371,7 @@ def build_pptx(
         ocr_device=ocr_device,
         min_text_confidence=ocr_confidence,
         font_name=font_name,
+        vision_model=vision_model,
         work_dir=work_dir,
     )
 
@@ -417,12 +421,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--analysis-engine",
-        choices=("vlm", "ocr", "structure"),
+        choices=("vlm", "openai", "ocr", "structure"),
         default="vlm",
         help=(
             "vlm=使用 PaddleOCR-VL 1.6 直接理解整页（默认）；"
+            "openai=使用高精度 OpenAI 视觉模型（需 OPENAI_API_KEY）；"
             "ocr/structure 仅保留为本地诊断后备。"
         ),
+    )
+    parser.add_argument(
+        "--vision-model",
+        default=DEFAULT_OPENAI_VISION_MODEL,
+        help="--analysis-engine openai 使用的模型；默认采用当前高精度视觉模型。",
     )
     parser.add_argument("--ocr-lang", choices=("auto", "ch", "en"), default="auto")
     parser.add_argument(
@@ -436,8 +446,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ocr-conf",
         type=float,
-        default=0.78,
-        help="仅用于 ocr/structure 后备引擎的文字置信度阈值。",
+        default=0.70,
+        help="转为可编辑文字的最低置信度；低于阈值的区域保留为图片以避免误写。",
     )
     parser.add_argument("--font-name", default="Microsoft YaHei")
     args = parser.parse_args(argv)
@@ -477,6 +487,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"页面分析：{args.analysis_engine}")
     if args.analysis_engine == "vlm":
         print("视觉模型：PaddleOCR-VL 1.6（本地，不使用 DeepSeek）")
+    elif args.analysis_engine == "openai":
+        print(f"视觉模型：{args.vision_model}（OpenAI，高精度原图模式）")
     resolution = "自动（1280 至 2560 宽）" if args.width == 0 else f"{args.width}x{args.height}"
     print(f"校正分辨率：{resolution}")
     try:
@@ -528,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
             ocr_device=args.ocr_device,
             ocr_confidence=args.ocr_conf,
             font_name=args.font_name,
+            vision_model=args.vision_model,
             work_dir=args.work_dir / "reconstruction",
         )
     except Exception as exc:

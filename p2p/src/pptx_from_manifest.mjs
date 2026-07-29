@@ -200,14 +200,18 @@ async function buildWithArtifact({ manifest, out, workspace, previewDir, layoutD
         line: { style: "solid", fill: "#00000000", width: 0 },
       });
       shape.text = String(item.text || "");
-      shape.text.fontSize = Number(item.fontSize || 14);
-      shape.text.typeface = item.typeface || "Microsoft YaHei";
-      shape.text.color = normalizeColor(item.color, "#222222");
-      shape.text.bold = Boolean(item.bold);
-      shape.text.alignment = item.align || "left";
-      shape.text.verticalAlignment = item.valign || "middle";
-      shape.text.insets = { left: 0, right: 0, top: 0, bottom: 0 };
-      shape.text.wrap = "square";
+      shape.text.style = {
+        fontSize: Number(item.fontSize || 14),
+        typeface: item.typeface || "Microsoft YaHei",
+        color: normalizeColor(item.color, "#222222"),
+        bold: Boolean(item.bold),
+        italic: Boolean(item.italic),
+        alignment: item.align || "left",
+        verticalAlignment: item.valign || "middle",
+        insets: { left: 0, right: 0, top: 0, bottom: 0 },
+        wrap: "none",
+        autoFit: "none",
+      };
     }
     slideRecords.push({ slide, number: Number(slideSpec.number) });
   }
@@ -311,10 +315,10 @@ async function buildWithPptxGen({ manifest, out }) {
         fontSize: Number(item.fontSizePt || 10.5),
         color: pptxColor(item.color, "222222"),
         bold: Boolean(item.bold),
+        italic: Boolean(item.italic),
         align: item.align || "left",
         valign: item.valign === "middle" ? "mid" : item.valign || "mid",
         rotate: Number(item.rotation || 0),
-        fit: "shrink",
         fill: { color: "FFFFFF", transparency: 100 },
         line: { color: "FFFFFF", transparency: 100 },
         breakLine: false,

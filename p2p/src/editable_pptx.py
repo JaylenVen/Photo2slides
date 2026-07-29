@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import html
 import json
 import importlib.util
@@ -9,7 +10,10 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Iterable
@@ -17,14 +21,24 @@ from typing import Any, Iterable
 import cv2
 import numpy as np
 
-from image_enhancement import prepare_ocr_image
+from image_enhancement import (
+    descreen_presentation_image,
+    normalize_nearly_solid_background,
+    prepare_ocr_image,
+    repair_border_occlusions,
+)
 
 
 SLIDE_SIZE = (1280, 720)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RECONSTRUCTION_DIR = (
+    PROJECT_ROOT / "data" / "intermediate" / "runs" / "latest" / "reconstruction"
+)
 MAX_NATIVE_SHAPES = 80
 MAX_VISUAL_ASSETS = 24
 PADDLEOCR_VL_PIPELINE_VERSION = "v1.6"
 PADDLEOCR_VL_MODEL_NAME = "PaddleOCR-VL-1.6-0.9B"
+DEFAULT_OPENAI_VISION_MODEL = "gpt-5.6"
 VISUAL_LAYOUT_LABELS = {
     "algorithm",
     "chart",
@@ -93,6 +107,7 @@ class OCRLine:
     text: str
     confidence: float
     label: str = "text"
+    style: dict[str, Any] | None = None
 
     @property
     def bbox(self) -> tuple[int, int, int, int]:
@@ -109,6 +124,7 @@ class OCRLine:
 @dataclass(frozen=True)
 class RegionAnalysis:
     mask: np.ndarray
+    raw_mask: np.ndarray
     foreground_bgr: tuple[int, int, int]
     background_bgr: tuple[int, int, int]
     background_uniform: bool
@@ -406,6 +422,301 @@ def _vlm_blocks_from_output(
     return _deduplicate_ocr_lines(lines), layout_regions, blocks_for_audit
 
 
+def _responses_output_text(response: dict[str, Any]) -> str:
+    direct = response.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    for item in response.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for content in item.get("content") or []:
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") == "output_text" and isinstance(content.get("text"), str):
+                return content["text"].strip()
+    raise RuntimeError("OpenAI vision response did not contain structured output text")
+
+
+def _scaled_bbox(
+    values: Any,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int] | None:
+    if not isinstance(values, (list, tuple)) or len(values) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = [float(value) for value in values]
+    except (TypeError, ValueError):
+        return None
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    bbox = _clip_bbox(
+        (
+            int(round(x1 * width / 1000.0)),
+            int(round(y1 * height / 1000.0)),
+            int(round(x2 * width / 1000.0)),
+            int(round(y2 * height / 1000.0)),
+        ),
+        width,
+        height,
+    )
+    if bbox[2] - bbox[0] < 3 or bbox[3] - bbox[1] < 3:
+        return None
+    return bbox
+
+
+def _openai_slide_schema() -> dict[str, Any]:
+    text_region = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "text",
+            "confidence",
+            "label",
+            "bbox",
+            "fontFamily",
+            "fontWeight",
+            "fontStyle",
+            "color",
+            "align",
+            "editable",
+            "uncertain",
+        ],
+        "properties": {
+            "text": {"type": "string"},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "label": {
+                "type": "string",
+                "enum": [
+                    "doc_title",
+                    "paragraph_title",
+                    "subtitle",
+                    "text",
+                    "list",
+                    "caption",
+                    "footer",
+                    "number",
+                ],
+            },
+            "bbox": {
+                "type": "array",
+                "items": {"type": "number", "minimum": 0, "maximum": 1000},
+                "minItems": 4,
+                "maxItems": 4,
+            },
+            "fontFamily": {"type": "string"},
+            "fontWeight": {"type": "string", "enum": ["regular", "bold"]},
+            "fontStyle": {"type": "string", "enum": ["normal", "italic"]},
+            "color": {"type": "string"},
+            "align": {
+                "type": "string",
+                "enum": ["left", "center", "right", "justify"],
+            },
+            "editable": {"type": "boolean"},
+            "uncertain": {"type": "boolean"},
+        },
+    }
+    occlusion = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["kind", "confidence", "bbox"],
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["person", "lectern", "foreground_object", "unknown"],
+            },
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "bbox": {
+                "type": "array",
+                "items": {"type": "number", "minimum": 0, "maximum": 1000},
+                "minItems": 4,
+                "maxItems": 4,
+            },
+        },
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["regions", "occlusions", "background"],
+        "properties": {
+            "regions": {"type": "array", "items": text_region},
+            "occlusions": {"type": "array", "items": occlusion},
+            "background": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "nearlyUniform",
+                    "hasLightingGradient",
+                    "hasMoire",
+                ],
+                "properties": {
+                    "nearlyUniform": {"type": "boolean"},
+                    "hasLightingGradient": {"type": "boolean"},
+                    "hasMoire": {"type": "boolean"},
+                },
+            },
+        },
+    }
+
+
+class OpenAIVisionEngine:
+    """High-detail slide understanding through the OpenAI Responses API."""
+
+    def __init__(
+        self,
+        model: str = DEFAULT_OPENAI_VISION_MODEL,
+        *,
+        api_key_env: str = "OPENAI_API_KEY",
+        timeout_seconds: float = 180.0,
+    ) -> None:
+        api_key = os.environ.get(api_key_env, "").strip()
+        if not api_key:
+            raise RuntimeError(
+                f"{api_key_env} is required for --analysis-engine openai. "
+                "Use --analysis-engine vlm to keep all processing local."
+            )
+        self.api_key = api_key
+        self.model_name = model
+        self.timeout_seconds = float(timeout_seconds)
+        self.last_language = "multilingual"
+        self.last_layout_regions: list[dict[str, Any]] = []
+        self.last_blocks: list[dict[str, Any]] = []
+        self.last_occlusions: list[dict[str, Any]] = []
+        self.last_background_analysis: dict[str, Any] = {}
+
+    def recognize(self, image: np.ndarray, min_confidence: float) -> list[OCRLine]:
+        success, encoded = cv2.imencode(".png", image)
+        if not success:
+            raise RuntimeError("Could not encode slide image for OpenAI vision")
+        image_url = "data:image/png;base64," + base64.b64encode(encoded).decode("ascii")
+        prompt = (
+            "Analyze this photographed presentation slide for faithful PPT reconstruction. "
+            "Transcribe every visible text region exactly, preserving visible line breaks. "
+            "Return tight bounding boxes around the visible glyphs using 0-1000 coordinates. "
+            "Estimate font family, bold/italic style, color, and paragraph alignment from the image. "
+            "Mark a region uncertain when small or blurred characters cannot be read reliably; do not "
+            "invent text hidden by a person, lectern, or other foreground object. Identify only real "
+            "foreground occlusions that are not authored slide content. A low-confidence region may "
+            "contain a best reading, but editable must be false when confidence is below "
+            f"{float(min_confidence):.2f}."
+        )
+        request_body = {
+            "model": self.model_name,
+            "reasoning": {"effort": "high"},
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": "original",
+                        },
+                    ],
+                }
+            ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "slide_reconstruction",
+                    "strict": True,
+                    "schema": _openai_slide_schema(),
+                }
+            },
+        }
+        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        request = urllib.request.Request(
+            f"{base_url}/responses",
+            data=json.dumps(request_body).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "photo2slide/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"OpenAI vision request failed with HTTP {exc.code}: {detail[:800]}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"OpenAI vision request failed: {exc.reason}") from exc
+
+        analysis = json.loads(_responses_output_text(payload))
+        height, width = image.shape[:2]
+        lines: list[OCRLine] = []
+        layout_regions: list[dict[str, Any]] = []
+        blocks: list[dict[str, Any]] = []
+        for region in analysis.get("regions") or []:
+            if not isinstance(region, dict):
+                continue
+            text = _normalize_vlm_text(region.get("text", ""))
+            bbox = _scaled_bbox(region.get("bbox"), width, height)
+            if not text or bbox is None:
+                continue
+            confidence = float(np.clip(region.get("confidence", 0.0), 0.0, 1.0))
+            label = str(region.get("label", "text")).casefold()
+            if label not in VLM_TEXT_LAYOUT_LABELS:
+                label = "text"
+            x1, y1, x2, y2 = bbox
+            polygon = np.asarray(
+                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                dtype=np.float32,
+            )
+            style = {
+                "fontFamily": str(region.get("fontFamily", "")).strip(),
+                "bold": region.get("fontWeight") == "bold",
+                "italic": region.get("fontStyle") == "italic",
+                "color": str(region.get("color", "")).strip(),
+                "align": str(region.get("align", "left")),
+                "editable": bool(region.get("editable", True)),
+                "uncertain": bool(region.get("uncertain", False)),
+            }
+            lines.append(OCRLine(polygon, text, confidence, label, style))
+            layout_regions.append(
+                {
+                    "label": label,
+                    "score": round(confidence, 6),
+                    "bbox": list(bbox),
+                }
+            )
+            blocks.append(
+                {
+                    "label": label,
+                    "bbox": list(bbox),
+                    "confidence": round(confidence, 6),
+                    "content": text,
+                    "style": style,
+                }
+            )
+
+        occlusions: list[dict[str, Any]] = []
+        for region in analysis.get("occlusions") or []:
+            if not isinstance(region, dict):
+                continue
+            bbox = _scaled_bbox(region.get("bbox"), width, height)
+            confidence = float(np.clip(region.get("confidence", 0.0), 0.0, 1.0))
+            if bbox is None or confidence < 0.55:
+                continue
+            occlusions.append(
+                {
+                    "kind": str(region.get("kind", "unknown")),
+                    "confidence": round(confidence, 6),
+                    "bbox": list(bbox),
+                }
+            )
+        self.last_layout_regions = layout_regions
+        self.last_blocks = blocks
+        self.last_occlusions = occlusions
+        self.last_background_analysis = dict(analysis.get("background") or {})
+        return _deduplicate_ocr_lines(lines)
+
+
 class PaddleOCREngine:
     def __init__(self, language: str, device: str) -> None:
         self.language = language
@@ -522,7 +833,7 @@ class PPStructureV3Engine:
     def __init__(self, language: str, device: str) -> None:
         if _package_major_version("paddleocr") < 3:
             raise RuntimeError(
-                "PP-StructureV3 requires PaddleOCR 3.x; install p2p/requirements-vision.txt"
+                "PP-StructureV3 requires PaddleOCR 3.x; install p2p/requirements.txt"
             )
         self.language = language
         self.last_language = "ch+en" if language in {"auto", "ch"} else language
@@ -553,7 +864,7 @@ class PPStructureV3Engine:
         except RuntimeError as exc:
             if "dependency error occurred during pipeline creation" not in str(exc).casefold():
                 raise
-            requirements_path = Path(__file__).resolve().parents[1] / "requirements-vision.txt"
+            requirements_path = PROJECT_ROOT / "requirements.txt"
             raise RuntimeError(
                 "PP-StructureV3 dependencies are incomplete or incompatible. "
                 f'Run: "{sys.executable}" -m pip install -r "{requirements_path}"'
@@ -596,7 +907,7 @@ class PaddleOCRVLEngine:
     def __init__(self, device: str) -> None:
         if _package_major_version("paddleocr") < 3:
             raise RuntimeError(
-                "PaddleOCR-VL requires PaddleOCR 3.x; install p2p/requirements-vision.txt"
+                "PaddleOCR-VL requires PaddleOCR 3.x; install p2p/requirements.txt"
             )
         self.last_language = "multilingual"
         self.last_layout_regions: list[dict[str, Any]] = []
@@ -622,7 +933,7 @@ class PaddleOCRVLEngine:
         try:
             self.engine = PaddleOCRVL(**options)
         except RuntimeError as exc:
-            requirements_path = Path(__file__).resolve().parents[1] / "requirements-vision.txt"
+            requirements_path = PROJECT_ROOT / "requirements.txt"
             raise RuntimeError(
                 "PaddleOCR-VL could not be initialized. "
                 f'Run: "{sys.executable}" -m pip install -r "{requirements_path}"'
@@ -796,6 +1107,19 @@ def _bbox_iou(first: Iterable[float], second: Iterable[float]) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+def _bbox_overlap_fraction(
+    first: Iterable[float],
+    second: Iterable[float],
+) -> float:
+    ax1, ay1, ax2, ay2 = [float(value) for value in first]
+    bx1, by1, bx2, by2 = [float(value) for value in second]
+    intersection = max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(
+        0.0,
+        min(ay2, by2) - max(ay1, by1),
+    )
+    return intersection / max(1.0, (ax2 - ax1) * (ay2 - ay1))
+
+
 def _deduplicate_ocr_lines(lines: list[OCRLine]) -> list[OCRLine]:
     accepted: list[OCRLine] = []
     for line in sorted(lines, key=lambda item: item.confidence, reverse=True):
@@ -876,7 +1200,7 @@ def _analyze_text_region(image: np.ndarray, line: OCRLine) -> RegionAnalysis:
     if len(background_pixels) < 16:
         background_pixels = roi.reshape(-1, 3)
     background = np.median(background_pixels, axis=0).astype(np.uint8)
-    uniform = _robust_spread(background_pixels) < 21.0
+    uniform = _robust_spread(background_pixels) < 8.75
 
     lab_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
     lab_background = cv2.cvtColor(background.reshape(1, 1, 3), cv2.COLOR_BGR2LAB).astype(
@@ -898,7 +1222,7 @@ def _analyze_text_region(image: np.ndarray, line: OCRLine) -> RegionAnalysis:
 
     undilated_ink = ink.copy()
     ink_mask = (ink.astype(np.uint8) * 255)
-    dilation_size = max(1, int(round(line_height * 0.065)))
+    dilation_size = max(1, int(round(line_height * 0.095)))
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (dilation_size * 2 + 1, dilation_size * 2 + 1)
     )
@@ -920,8 +1244,11 @@ def _analyze_text_region(image: np.ndarray, line: OCRLine) -> RegionAnalysis:
 
     global_mask = np.zeros((height, width), dtype=np.uint8)
     global_mask[ry1:ry2, rx1:rx2] = ink_mask
+    global_raw_mask = np.zeros((height, width), dtype=np.uint8)
+    global_raw_mask[ry1:ry2, rx1:rx2] = undilated_ink.astype(np.uint8) * 255
     return RegionAnalysis(
         mask=global_mask,
+        raw_mask=global_raw_mask,
         foreground_bgr=tuple(int(value) for value in foreground),
         background_bgr=tuple(int(value) for value in background),
         background_uniform=uniform,
@@ -942,17 +1269,135 @@ def _text_rotation(line: OCRLine) -> float:
     return 0.0 if abs(angle) < 1.25 else float(np.clip(angle, -15.0, 15.0))
 
 
+def _replace_text_polygon_with_row_field(
+    source: np.ndarray,
+    target: np.ndarray,
+    line: OCRLine,
+    background_bgr: tuple[int, int, int] | None,
+) -> bool:
+    """Rebuild a text area from same-row neighbors, preserving banded gradients."""
+
+    height, width = source.shape[:2]
+    x1, y1, x2, y2 = _clip_bbox(line.bbox, width, height)
+    line_height = max(1, y2 - y1)
+    sample_width = max(16, min(64, int(round(line_height * 0.55))))
+    vertical_margin = max(8, min(24, int(round(line_height * 0.16))))
+    rx1, ry1, rx2, ry2 = _clip_bbox(
+        (
+            x1 - sample_width * 2,
+            y1 - vertical_margin,
+            x2 + sample_width * 2,
+            y2 + vertical_margin,
+        ),
+        width,
+        height,
+    )
+    roi = source[ry1:ry2, rx1:rx2]
+    if roi.size == 0:
+        return False
+    local_polygon = np.rint(
+        line.polygon - np.asarray([rx1, ry1], dtype=np.float32)
+    ).astype(np.int32)
+    polygon_mask = np.zeros(roi.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(polygon_mask, [local_polygon], 255)
+    replacement_margin = max(6, min(22, int(round(line_height * 0.14))))
+    polygon_mask = cv2.dilate(
+        polygon_mask,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (replacement_margin * 2 + 1, replacement_margin * 2 + 1),
+        ),
+    )
+
+    field = roi.astype(np.float32).copy()
+    background = (
+        np.asarray(background_bgr, dtype=np.float32)
+        if background_bgr is not None
+        else None
+    )
+    filled_rows = 0
+    for row in range(roi.shape[0]):
+        columns = np.flatnonzero(polygon_mask[row] > 0)
+        if columns.size == 0:
+            continue
+        left_edge = int(columns[0])
+        right_edge = int(columns[-1]) + 1
+        left = roi[
+            row,
+            max(0, left_edge - sample_width * 2) : max(0, left_edge - 2),
+        ]
+        right = roi[
+            row,
+            min(roi.shape[1], right_edge + 2) : min(
+                roi.shape[1],
+                right_edge + sample_width * 2,
+            ),
+        ]
+
+        def representative(pixels: np.ndarray) -> np.ndarray | None:
+            if len(pixels) < 4:
+                return None
+            values = pixels.astype(np.float32)
+            if background is not None:
+                similar = (
+                    np.linalg.norm(values - background[None, :], axis=1)
+                    <= 52.0
+                )
+                if int(similar.sum()) >= 4:
+                    values = values[similar]
+            return np.median(values, axis=0) if len(values) >= 4 else None
+
+        left_color = representative(left)
+        right_color = representative(right)
+        if left_color is None and right_color is None:
+            if background is None:
+                continue
+            left_color = right_color = background
+        elif left_color is None:
+            left_color = right_color
+        elif right_color is None:
+            right_color = left_color
+        assert left_color is not None and right_color is not None
+        blend = np.linspace(
+            0.0,
+            1.0,
+            roi.shape[1],
+            dtype=np.float32,
+        )[:, None]
+        field[row] = left_color * (1.0 - blend) + right_color * blend
+        filled_rows += 1
+    if filled_rows < max(4, int(round((y2 - y1) * 0.70))):
+        return False
+    binary_alpha = polygon_mask.astype(np.float32) / 255.0
+    feathered_alpha = cv2.GaussianBlur(
+        binary_alpha,
+        (0, 0),
+        max(2.0, line_height * 0.045),
+    )
+    alpha = np.maximum(binary_alpha, feathered_alpha)[:, :, None]
+    target_roi = target[ry1:ry2, rx1:rx2].astype(np.float32)
+    target[ry1:ry2, rx1:rx2] = np.clip(
+        target_roi * (1.0 - alpha) + field * alpha,
+        0,
+        255,
+    ).astype(np.uint8)
+    return True
+
+
 def _replace_text_polygon_with_plane(
     source: np.ndarray,
     target: np.ndarray,
     line: OCRLine,
+    *,
+    background_uniform: bool = False,
+    background_bgr: tuple[int, int, int] | None = None,
 ) -> bool:
     """Replace a text polygon with a smooth local background model."""
 
     height, width = source.shape[:2]
     x1, y1, x2, y2 = _clip_bbox(line.bbox, width, height)
     line_height = max(1, y2 - y1)
-    padding = max(8, int(round(line_height * 0.38)))
+    padding = max(12, int(round(line_height * 0.72)))
     rx1, ry1, rx2, ry2 = _clip_bbox(
         (x1 - padding, y1 - padding, x2 + padding, y2 + padding), width, height
     )
@@ -962,12 +1407,36 @@ def _replace_text_polygon_with_plane(
     local_polygon = np.rint(line.polygon - np.array([rx1, ry1])).astype(np.int32)
     polygon_mask = np.zeros(roi.shape[:2], dtype=np.uint8)
     cv2.fillPoly(polygon_mask, [local_polygon], 255)
-    polygon_mask = cv2.dilate(polygon_mask, np.ones((3, 3), np.uint8))
+    replacement_margin = max(6, min(22, int(round(line_height * 0.14))))
+    polygon_mask = cv2.dilate(
+        polygon_mask,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (replacement_margin * 2 + 1, replacement_margin * 2 + 1),
+        ),
+    )
     ring_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (padding * 2 + 1, padding * 2 + 1)
     )
     ring_mask = cv2.subtract(cv2.dilate(polygon_mask, ring_kernel), polygon_mask)
-    ys, xs = np.nonzero(ring_mask)
+    sample_mask = ring_mask
+    if background_bgr is not None:
+        lab_roi = cv2.cvtColor(roi.astype(np.uint8), cv2.COLOR_BGR2LAB).astype(
+            np.float32
+        )
+        lab_background = cv2.cvtColor(
+            np.asarray([[background_bgr]], dtype=np.uint8),
+            cv2.COLOR_BGR2LAB,
+        ).astype(np.float32)[0, 0]
+        background_distance = np.linalg.norm(
+            lab_roi - lab_background,
+            axis=2,
+        )
+        distance_limit = 26.0 if background_uniform else 18.0
+        sample_mask = (
+            (polygon_mask == 0) & (background_distance <= distance_limit)
+        ).astype(np.uint8) * 255
+    ys, xs = np.nonzero(sample_mask)
     if len(xs) < 40:
         return False
     samples = roi[ys, xs]
@@ -982,50 +1451,598 @@ def _replace_text_polygon_with_plane(
         (
             xs_fit,
             ys_fit,
-            xs_fit * xs_fit,
-            ys_fit * ys_fit,
-            xs_fit * ys_fit,
             np.ones_like(xs_fit),
         )
     )
     coefficients, _, _, _ = np.linalg.lstsq(design, samples[keep], rcond=None)
+    all_x = xs.astype(np.float32) / max(1, roi.shape[1] - 1)
+    all_y = ys.astype(np.float32) / max(1, roi.shape[0] - 1)
+    ring_design = np.column_stack(
+        (
+            all_x,
+            all_y,
+            np.ones_like(all_x),
+        )
+    )
+    ring_error = np.linalg.norm(ring_design @ coefficients - samples, axis=1)
+    if not background_uniform:
+        eval_y, eval_x = np.nonzero(ring_mask)
+        eval_samples = roi[eval_y, eval_x]
+        eval_design = np.column_stack(
+            (
+                eval_x.astype(np.float32) / max(1, roi.shape[1] - 1),
+                eval_y.astype(np.float32) / max(1, roi.shape[0] - 1),
+                np.ones_like(eval_x, dtype=np.float32),
+            )
+        )
+        eval_error = np.linalg.norm(
+            eval_design @ coefficients - eval_samples,
+            axis=1,
+        )
+        if (
+            float(np.median(eval_error)) > 8.5
+            or float(np.mean(eval_error <= 18.0)) < 0.72
+        ):
+            return _replace_text_polygon_with_row_field(
+                source,
+                target,
+                line,
+                background_bgr,
+            )
 
     grid_y, grid_x = np.indices(roi.shape[:2], dtype=np.float32)
     all_design = np.stack(
         (
             grid_x / max(1, roi.shape[1] - 1),
             grid_y / max(1, roi.shape[0] - 1),
-            (grid_x / max(1, roi.shape[1] - 1)) ** 2,
-            (grid_y / max(1, roi.shape[0] - 1)) ** 2,
-            (grid_x / max(1, roi.shape[1] - 1))
-            * (grid_y / max(1, roi.shape[0] - 1)),
             np.ones_like(grid_x),
         ),
         axis=-1,
     )
     plane = np.clip(all_design @ coefficients, 0, 255)
-    alpha = cv2.GaussianBlur(
-        polygon_mask.astype(np.float32) / 255.0,
-        (0, 0),
-        max(1.5, line_height * 0.10),
-    )
-    alpha = alpha[:, :, None]
-    target_roi = target[ry1:ry2, rx1:rx2].astype(np.float32)
-    target[ry1:ry2, rx1:rx2] = np.clip(
-        target_roi * (1.0 - alpha) + plane * alpha, 0, 255
-    ).astype(np.uint8)
+    try:
+        cloned = cv2.seamlessClone(
+            plane.astype(np.uint8),
+            target,
+            polygon_mask,
+            ((rx1 + rx2) // 2, (ry1 + ry2) // 2),
+            cv2.NORMAL_CLONE,
+        )
+        target[:] = cloned
+    except cv2.error:
+        binary_alpha = polygon_mask.astype(np.float32) / 255.0
+        feathered_alpha = cv2.GaussianBlur(
+            binary_alpha,
+            (0, 0),
+            max(1.5, line_height * 0.10),
+        )
+        alpha = np.maximum(binary_alpha, feathered_alpha)[:, :, None]
+        target_roi = target[ry1:ry2, rx1:rx2].astype(np.float32)
+        target[ry1:ry2, rx1:rx2] = np.clip(
+            target_roi * (1.0 - alpha) + plane * alpha, 0, 255
+        ).astype(np.uint8)
     return True
+
+
+def _text_ink_mask(
+    image: np.ndarray,
+    analysis: RegionAnalysis,
+    line: OCRLine,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    x1, y1, x2, y2 = _clip_bbox(line.bbox, width, height)
+    roi = image[y1:y2, x1:x2]
+    result = np.zeros((height, width), dtype=np.uint8)
+    if roi.size == 0:
+        return result
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    box_height = max(1, y2 - y1)
+    kernel_width = max(5, int(round(box_height * 0.12)))
+    kernel_height = max(3, int(round(box_height * 0.07)))
+    if kernel_width % 2 == 0:
+        kernel_width += 1
+    if kernel_height % 2 == 0:
+        kernel_height += 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (kernel_width, kernel_height),
+    )
+    foreground_luminance = float(
+        cv2.cvtColor(
+            np.asarray([[analysis.foreground_bgr]], dtype=np.uint8),
+            cv2.COLOR_BGR2GRAY,
+        )[0, 0]
+    )
+    background_luminance = float(
+        cv2.cvtColor(
+            np.asarray([[analysis.background_bgr]], dtype=np.uint8),
+            cv2.COLOR_BGR2GRAY,
+        )[0, 0]
+    )
+    if foreground_luminance <= background_luminance:
+        estimated_background = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+        contrast = cv2.subtract(estimated_background, gray)
+    else:
+        estimated_background = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+        contrast = cv2.subtract(gray, estimated_background)
+
+    if int(contrast.max()) < 4:
+        return analysis.raw_mask.copy()
+    otsu_threshold, _ = cv2.threshold(
+        contrast,
+        0,
+        255,
+        cv2.THRESH_BINARY | cv2.THRESH_OTSU,
+    )
+    threshold = max(4.0, float(otsu_threshold) * 0.72)
+    ink = (contrast >= threshold).astype(np.uint8) * 255
+    ink = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        np.ones((2, 2), dtype=np.uint8),
+    )
+
+    local_polygon = np.round(
+        line.polygon - np.asarray([x1, y1], dtype=np.float32)
+    ).astype(np.int32)
+    polygon_mask = np.zeros_like(ink)
+    cv2.fillPoly(polygon_mask, [local_polygon], 255)
+    ink = cv2.bitwise_and(ink, polygon_mask)
+    raw_local = cv2.bitwise_and(
+        analysis.raw_mask[y1:y2, x1:x2],
+        polygon_mask,
+    )
+    raw_density = cv2.countNonZero(raw_local) / max(1, raw_local.size)
+    if raw_density <= 0.22:
+        ink = cv2.bitwise_or(ink, raw_local)
+    if cv2.countNonZero(ink) < 6:
+        return analysis.raw_mask.copy()
+    result[y1:y2, x1:x2] = ink
+    return result
+
+
+def _text_row_boxes(
+    ink_mask: np.ndarray,
+    line: OCRLine,
+    width: int,
+    height: int,
+) -> list[tuple[int, int, int, int]]:
+    x1, y1, x2, y2 = _clip_bbox(line.bbox, width, height)
+    raw = ink_mask[y1:y2, x1:x2] > 0
+    expanded = cv2.dilate(
+        raw.astype(np.uint8),
+        np.ones((3, 3), dtype=np.uint8),
+        iterations=1,
+    ) > 0
+    if not raw.any():
+        raw = expanded
+    projection = raw.sum(axis=1)
+    nonzero = projection[projection > 0]
+    if nonzero.size == 0:
+        return [(x1, y1, x2, y2)]
+    threshold = max(1.0, min(float(np.percentile(nonzero, 22)) * 0.42, (x2 - x1) * 0.01))
+    active = (projection >= threshold).astype(np.uint8).reshape(-1, 1)
+    active = cv2.morphologyEx(active, cv2.MORPH_CLOSE, np.ones((3, 1), np.uint8)).reshape(-1)
+
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(active):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            runs.append((start, index))
+            start = None
+    if start is not None:
+        runs.append((start, len(active)))
+
+    minimum_height = max(2, int(round((y2 - y1) * 0.035)))
+    runs = [run for run in runs if run[1] - run[0] >= minimum_height]
+    merged: list[tuple[int, int]] = []
+    maximum_gap = max(1, int(round((y2 - y1) * 0.012)))
+    for run in runs:
+        if merged and run[0] - merged[-1][1] <= maximum_gap:
+            merged[-1] = (merged[-1][0], run[1])
+        else:
+            merged.append(run)
+    maximum_rows = 24 if len(line.text.strip()) >= 200 else 8
+    if not merged or len(merged) > maximum_rows:
+        return [(x1, y1, x2, y2)]
+
+    boxes: list[tuple[int, int, int, int]] = []
+    for top, bottom in merged:
+        top = max(0, top - 1)
+        bottom = min(y2 - y1, bottom + 1)
+        row_pixels = expanded[top:bottom]
+        columns = np.flatnonzero(row_pixels.any(axis=0))
+        if columns.size == 0:
+            continue
+        left = max(0, int(columns[0]) - 1)
+        right = min(x2 - x1, int(columns[-1]) + 2)
+        boxes.append((x1 + left, y1 + top, x1 + right, y1 + bottom))
+    return boxes or [(x1, y1, x2, y2)]
+
+
+def _complete_long_text_row_boxes(
+    line: OCRLine,
+    boxes: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+) -> list[tuple[int, int, int, int]]:
+    """Supply row geometry when capture noise merges a long paragraph into one blob."""
+
+    if len(line.text.strip()) < 120:
+        return boxes
+    x1, y1, x2, y2 = _clip_bbox(line.bbox, width, height)
+    box_width = max(1, x2 - x1)
+    box_height = max(1, y2 - y1)
+    estimated_rows = int(
+        round(
+            math.sqrt(
+                _text_character_units(" ".join(line.text.split()))
+                * 0.58
+                * box_height
+                / box_width
+            )
+        )
+    )
+    explicit_rows = len([row for row in line.text.splitlines() if row.strip()])
+    estimated_rows = int(np.clip(max(estimated_rows, explicit_rows), 1, 24))
+    if estimated_rows < 3 or len(boxes) >= max(2, math.ceil(estimated_rows * 0.55)):
+        return boxes
+
+    edges = np.linspace(y1, y2, estimated_rows + 1)
+    gap = max(1, int(round(box_height / estimated_rows * 0.08)))
+    return [
+        (
+            x1,
+            int(round(edges[index])) + gap,
+            x2,
+            max(
+                int(round(edges[index])) + gap + 1,
+                int(round(edges[index + 1])) - gap,
+            ),
+        )
+        for index in range(estimated_rows)
+    ]
+
+
+def _split_tokens_for_rows(text: str, row_widths: list[float]) -> list[str]:
+    row_count = len(row_widths)
+    explicit = [row.strip() for row in text.splitlines() if row.strip()]
+    if len(explicit) == row_count:
+        return explicit
+    normalized = " ".join(text.split())
+    if row_count <= 1 or not normalized:
+        return [normalized]
+
+    tokens = re.findall(r"[\u3400-\u9fff]|[^\s\u3400-\u9fff]+(?:\s+)?", normalized)
+    expanded_tokens: list[str] = []
+    for token in tokens:
+        numeric_range = re.search(r"(\d+[-–—])(\d+)", token)
+        if numeric_range:
+            prefix = token[: numeric_range.start()]
+            suffix = token[numeric_range.end() :]
+            if prefix:
+                expanded_tokens.append(prefix)
+            expanded_tokens.extend(
+                [numeric_range.group(1), numeric_range.group(2) + suffix]
+            )
+        else:
+            expanded_tokens.append(token)
+    tokens = expanded_tokens
+    if len(tokens) < row_count:
+        return _wrap_text_for_rows(normalized, row_count).splitlines()
+    weights = np.asarray(
+        [max(0.15, _text_character_units(token.rstrip())) for token in tokens],
+        dtype=np.float32,
+    )
+    widths = np.maximum(np.asarray(row_widths, dtype=np.float32), 1.0)
+    target_cumulative = np.cumsum(widths / widths.sum())[:-1] * float(weights.sum())
+    cumulative = np.cumsum(weights)
+    breaks: list[int] = []
+    minimum_index = 1
+    for target_index, target in enumerate(target_cumulative):
+        maximum_index = len(tokens) - (row_count - target_index - 1)
+        choices = np.arange(minimum_index, maximum_index + 1)
+        best = int(choices[np.argmin(np.abs(cumulative[choices - 1] - target))])
+        breaks.append(best)
+        minimum_index = best + 1
+
+    rows: list[str] = []
+    start = 0
+    for stop in [*breaks, len(tokens)]:
+        rows.append("".join(tokens[start:stop]).strip())
+        start = stop
+    return rows
+
+
+def _row_has_detached_bullet(
+    raw_mask: np.ndarray,
+    bbox: tuple[int, int, int, int],
+) -> bool:
+    x1, y1, x2, y2 = bbox
+    crop = (raw_mask[y1:y2, x1:x2] > 0).astype(np.uint8)
+    if crop.size == 0 or not crop.any():
+        return False
+    count, _, stats, _ = cv2.connectedComponentsWithStats(crop, 8)
+    components = [
+        tuple(int(value) for value in stats[index])
+        for index in range(1, count)
+        if stats[index, cv2.CC_STAT_AREA] >= 3
+        and stats[index, cv2.CC_STAT_HEIGHT] >= 2
+    ]
+    if len(components) < 2:
+        return False
+    components.sort(key=lambda item: item[cv2.CC_STAT_LEFT])
+    first, second = components[0], components[1]
+    row_height = max(1, y2 - y1)
+    first_right = first[cv2.CC_STAT_LEFT] + first[cv2.CC_STAT_WIDTH]
+    gap = second[cv2.CC_STAT_LEFT] - first_right
+    aspect = first[cv2.CC_STAT_WIDTH] / max(1, first[cv2.CC_STAT_HEIGHT])
+    return bool(
+        first[cv2.CC_STAT_LEFT] <= row_height * 0.30
+        and first[cv2.CC_STAT_HEIGHT] <= row_height * 0.72
+        and 0.30 <= aspect <= 2.6
+        and gap >= row_height * 0.42
+    )
+
+
+def _infer_italic(
+    raw_mask: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    text: str,
+) -> bool:
+    x1, y1, x2, y2 = bbox
+    crop = (raw_mask[y1:y2, x1:x2] > 0).astype(np.uint8)
+    if crop.size == 0 or _text_character_units(text) < 5.0:
+        return False
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(crop, 8)
+    slopes: list[float] = []
+    minimum_height = max(5, int(round((y2 - y1) * 0.28)))
+    for component in range(1, count):
+        if (
+            stats[component, cv2.CC_STAT_AREA] < 6
+            or stats[component, cv2.CC_STAT_HEIGHT] < minimum_height
+        ):
+            continue
+        ys, xs = np.nonzero(labels == component)
+        variance = float(np.var(ys))
+        if variance < 1.0:
+            continue
+        slope = float(np.cov(ys, xs, bias=True)[0, 1] / variance)
+        if abs(slope) <= 1.0:
+            slopes.append(slope)
+    if len(slopes) < 5:
+        return False
+    median_slope = float(np.median(slopes))
+    negative_fraction = float(np.mean(np.asarray(slopes) < -0.045))
+    return median_slope < -0.075 and negative_fraction >= 0.58
+
+
+def _infer_bold(
+    raw_mask: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    text: str,
+) -> bool:
+    x1, y1, x2, y2 = bbox
+    crop = (raw_mask[y1:y2, x1:x2] > 0).astype(np.uint8)
+    box_height = max(1, y2 - y1)
+    if (
+        crop.size == 0
+        or box_height < 19
+        or _text_character_units(text) < 4.5
+    ):
+        return False
+    foreground = crop[crop > 0]
+    if foreground.size == 0:
+        return False
+    distances = cv2.distanceTransform(crop, cv2.DIST_L2, 5)
+    stroke_values = distances[distances > 0]
+    if stroke_values.size < 12:
+        return False
+    density = float(np.mean(crop))
+    stroke = float(np.percentile(stroke_values, 75))
+    return density >= 0.355 and stroke >= 1.75
+
+
+def _contains_cjk(text: str) -> bool:
+    return any("\u3400" <= character <= "\u9fff" for character in text)
+
+
+def _typeface_for_text(
+    text: str,
+    configured_font: str,
+    style: dict[str, Any] | None,
+) -> str:
+    suggested = str((style or {}).get("fontFamily", "")).strip()
+    if suggested and suggested.casefold() not in {
+        "sans",
+        "sans-serif",
+        "serif",
+        "unknown",
+    }:
+        return suggested
+    if _contains_cjk(text):
+        return configured_font
+    if configured_font.casefold() == "microsoft yahei":
+        return "Arial"
+    return configured_font
+
+
+@lru_cache(maxsize=64)
+def _font_file(typeface: str, bold: bool, italic: bool) -> str | None:
+    fonts_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    family = typeface.casefold().replace(" ", "")
+    known = {
+        "microsoftyahei": {
+            (False, False): "msyh.ttc",
+            (True, False): "msyhbd.ttc",
+            (False, True): "msyh.ttc",
+            (True, True): "msyhbd.ttc",
+        },
+        "arial": {
+            (False, False): "arial.ttf",
+            (True, False): "arialbd.ttf",
+            (False, True): "ariali.ttf",
+            (True, True): "arialbi.ttf",
+        },
+        "calibri": {
+            (False, False): "calibri.ttf",
+            (True, False): "calibrib.ttf",
+            (False, True): "calibrii.ttf",
+            (True, True): "calibriz.ttf",
+        },
+        "simhei": {
+            (False, False): "simhei.ttf",
+            (True, False): "simhei.ttf",
+            (False, True): "simhei.ttf",
+            (True, True): "simhei.ttf",
+        },
+        "simsun": {
+            (False, False): "simsun.ttc",
+            (True, False): "simsunb.ttf",
+            (False, True): "simsun.ttc",
+            (True, True): "simsunb.ttf",
+        },
+    }
+    filename = known.get(family, {}).get((bold, italic))
+    if filename and (fonts_dir / filename).is_file():
+        return str(fonts_dir / filename)
+    if fonts_dir.is_dir():
+        compact = re.sub(r"[^a-z0-9]", "", family)
+        for candidate in fonts_dir.iterdir():
+            if candidate.is_file() and re.sub(
+                r"[^a-z0-9]",
+                "",
+                candidate.stem.casefold(),
+            ).startswith(compact):
+                return str(candidate)
+    return None
+
+
+def _font_size_for_box(
+    text: str,
+    bbox: tuple[int, int, int, int],
+    *,
+    typeface: str,
+    bold: bool,
+    italic: bool,
+) -> float:
+    box_width = max(2.0, float(bbox[2] - bbox[0]))
+    box_height = max(2.0, float(bbox[3] - bbox[1]))
+    path = _font_file(typeface, bold, italic)
+    if path:
+        try:
+            from PIL import ImageFont
+
+            reference_size = 256
+            font = ImageFont.truetype(path, reference_size)
+            left, top, right, bottom = font.getbbox(text or "M")
+            measured_width = max(1.0, float(right - left))
+            measured_height = max(1.0, float(bottom - top))
+            by_height = box_height * reference_size / measured_height
+            by_width = box_width * reference_size / measured_width
+            return float(np.clip(min(by_height, by_width) * 0.985, 8.0, 96.0))
+        except (ImportError, OSError, ValueError):
+            pass
+    by_height = box_height * (1.10 if _contains_cjk(text) else 1.28)
+    by_width = box_width / max(1.0, _text_character_units(text) * 0.58)
+    return float(np.clip(min(by_height, by_width), 8.0, 96.0))
+
+
+def _row_foreground_color(
+    image: np.ndarray,
+    raw_mask: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    fallback: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    x1, y1, x2, y2 = bbox
+    selector = raw_mask[y1:y2, x1:x2] > 0
+    pixels = image[y1:y2, x1:x2][selector]
+    if len(pixels) < 4:
+        return fallback
+    luminance = cv2.cvtColor(
+        pixels.reshape(-1, 1, 3),
+        cv2.COLOR_BGR2GRAY,
+    ).reshape(-1)
+    fallback_luminance = float(
+        cv2.cvtColor(
+            np.asarray([[fallback]], dtype=np.uint8),
+            cv2.COLOR_BGR2GRAY,
+        )[0, 0]
+    )
+    if fallback_luminance <= 128:
+        selected = pixels[luminance <= np.percentile(luminance, 35)]
+    else:
+        selected = pixels[luminance >= np.percentile(luminance, 65)]
+    if len(selected) < 4:
+        selected = pixels
+    return tuple(int(value) for value in np.median(selected, axis=0))
+
+
+def _valid_hex_color(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", text):
+        return text.upper()
+    return None
+
+
+def _readable_text_color(
+    color: str,
+    background_bgr: tuple[int, int, int],
+) -> str:
+    """Keep inferred text colors legible when capture noise masks the real ink."""
+
+    parsed = _valid_hex_color(color) or "#202020"
+
+    def relative_luminance(red: int, green: int, blue: int) -> float:
+        channels = []
+        for value in (red, green, blue):
+            normalized = value / 255.0
+            channels.append(
+                normalized / 12.92
+                if normalized <= 0.04045
+                else ((normalized + 0.055) / 1.055) ** 2.4
+            )
+        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+    foreground = tuple(int(parsed[index : index + 2], 16) for index in (1, 3, 5))
+    blue, green, red = [int(value) for value in background_bgr]
+    foreground_luminance = relative_luminance(*foreground)
+    background_luminance = relative_luminance(red, green, blue)
+    contrast = (max(foreground_luminance, background_luminance) + 0.05) / (
+        min(foreground_luminance, background_luminance) + 0.05
+    )
+    if contrast >= 3.0:
+        return parsed
+
+    dark = "#20242B"
+    light = "#F7F9FC"
+    dark_contrast = (background_luminance + 0.05) / (
+        relative_luminance(0x20, 0x24, 0x2B) + 0.05
+    )
+    light_contrast = (relative_luminance(0xF7, 0xF9, 0xFC) + 0.05) / (
+        background_luminance + 0.05
+    )
+    return dark if dark_contrast >= light_contrast else light
 
 
 def _clean_text_and_build_specs(
     image: np.ndarray,
     lines: list[OCRLine],
     font_name: str,
+    *,
+    analysis_image: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
     height, width = image.shape[:2]
+    source = analysis_image if analysis_image is not None else image
+    if source.shape != image.shape:
+        raise ValueError("analysis_image must match image dimensions")
     safe_x = max(8.0, width * 0.012)
     safe_y = max(6.0, height * 0.012)
-    analyses = [_analyze_text_region(image, line) for line in lines]
+    analyses = [_analyze_text_region(source, line) for line in lines]
     cleaned = image.copy()
     inpaint_mask = np.zeros((height, width), dtype=np.uint8)
     full_mask = np.zeros((height, width), dtype=np.uint8)
@@ -1033,97 +2050,213 @@ def _clean_text_and_build_specs(
     for analysis in analyses:
         full_mask = cv2.bitwise_or(full_mask, analysis.mask)
     for line, analysis in zip(lines, analyses):
-        if analysis.background_uniform and _replace_text_polygon_with_plane(image, cleaned, line):
+        if _replace_text_polygon_with_plane(
+            image,
+            cleaned,
+            line,
+            background_uniform=analysis.background_uniform,
+            background_bgr=analysis.background_bgr,
+        ):
             continue
         inpaint_mask = cv2.bitwise_or(inpaint_mask, analysis.mask)
     if inpaint_mask.any():
-        radius = max(3, int(round(np.median([max(1, line.bbox[3] - line.bbox[1]) for line in lines]) * 0.11)))
+        radius = max(
+            3,
+            int(
+                round(
+                    np.median(
+                        [max(1, line.bbox[3] - line.bbox[1]) for line in lines]
+                    )
+                    * 0.16
+                )
+            ),
+        )
         cleaned = cv2.inpaint(cleaned, inpaint_mask, radius, cv2.INPAINT_TELEA)
 
-    target_scale = SLIDE_SIZE[1] / height
-    line_heights = [max(1, line.bbox[3] - line.bbox[1]) for line in lines]
-    median_height = float(np.median(line_heights)) if line_heights else 1.0
+    row_records: list[
+        tuple[
+            OCRLine,
+            RegionAnalysis,
+            np.ndarray,
+            tuple[int, int, int, int],
+            str,
+            bool,
+            bool,
+            bool,
+        ]
+    ] = []
+    for line, analysis in zip(lines, analyses):
+        ink_mask = _text_ink_mask(source, analysis, line, width, height)
+        boxes = _text_row_boxes(ink_mask, line, width, height)
+        if (
+            len(boxes) > 1
+            and len([row for row in line.text.splitlines() if row.strip()]) <= 1
+        ):
+            line_x1, line_y1, line_x2, line_y2 = _clip_bbox(
+                line.bbox,
+                width,
+                height,
+            )
+            estimated_rows = int(
+                round(
+                    math.sqrt(
+                        _text_character_units(" ".join(line.text.split()))
+                        * 0.58
+                        * max(1, line_y2 - line_y1)
+                        / max(1, line_x2 - line_x1)
+                    )
+                )
+            )
+            if estimated_rows <= 1:
+                boxes = [max(boxes, key=lambda box: box[2] - box[0])]
+        boxes = _complete_long_text_row_boxes(
+            line,
+            boxes,
+            width,
+            height,
+        )
+        row_texts = _split_tokens_for_rows(
+            line.text,
+            [max(1.0, float(box[2] - box[0])) for box in boxes],
+        )
+        if len(row_texts) != len(boxes):
+            boxes = [line.bbox]
+            row_texts = [line.text]
+        italic_votes = [
+            _infer_italic(ink_mask, box, row_text)
+            for box, row_text in zip(boxes, row_texts)
+        ]
+        block_italic = sum(italic_votes) >= max(1, math.ceil(len(boxes) * 0.5))
+        bold_votes = [
+            _infer_bold(ink_mask, box, row_text)
+            for box, row_text in zip(boxes, row_texts)
+        ]
+        block_bold = sum(bold_votes) >= max(1, math.ceil(len(boxes) * 0.5))
+        if line.label == "text" and len(line.text.strip()) >= 200:
+            block_italic = False
+            block_bold = False
+        for box, row_text in zip(boxes, row_texts):
+            detached_bullet = (
+                False
+                if line.label == "text" and len(line.text.strip()) >= 200
+                else _row_has_detached_bullet(ink_mask, box)
+            )
+            has_bullet = bool(
+                detached_bullet
+                or re.match(r"^[▪■□•·●○\-*]", row_text)
+            )
+            if detached_bullet and not re.match(r"^[▪■□•·●○\-*]", row_text):
+                row_text = f"• {row_text}"
+            row_records.append(
+                (
+                    line,
+                    analysis,
+                    ink_mask,
+                    box,
+                    row_text,
+                    has_bullet,
+                    block_italic,
+                    block_bold,
+                )
+            )
+
+    row_heights = [
+        max(1, box[3] - box[1])
+        for _, _, _, box, _, _, _, _ in row_records
+    ]
+    median_height = float(np.median(row_heights)) if row_heights else 1.0
+    anchor_tolerance = width * 0.025
+    left_anchor_counts = {
+        id(line): sum(
+            abs(other.bbox[0] - line.bbox[0]) <= anchor_tolerance
+            for other in lines
+        )
+        for line in lines
+    }
     specs: list[dict[str, Any]] = []
-    for index, (line, analysis) in enumerate(zip(lines, analyses), start=1):
-        x1, y1, x2, y2 = _clip_bbox(line.bbox, width, height)
+    spec_lines: list[OCRLine] = []
+    for index, (
+        line,
+        analysis,
+        ink_mask,
+        row_box,
+        display_text,
+        has_bullet,
+        inferred_italic,
+        inferred_bold,
+    ) in enumerate(
+        row_records,
+        start=1,
+    ):
+        x1, y1, x2, y2 = _clip_bbox(row_box, width, height)
         box_height = max(1, y2 - y1)
         box_width = max(1, x2 - x1)
+        line_x1, line_y1, line_x2, line_y2 = _clip_bbox(
+            line.bbox,
+            width,
+            height,
+        )
         is_title = (
             line.label in {"doc_title", "paragraph_title"}
             or (
-                y1 < height * 0.26
-                and box_width > width * 0.22
+                line_y1 < height * 0.26
+                and line_x2 - line_x1 > width * 0.22
                 and box_height >= median_height * 1.22
             )
         )
-        display_text = line.text
-        text_rows = [row for row in display_text.splitlines() if row.strip()] or [display_text]
-        if len(text_rows) == 1:
-            estimated_line_height = min(box_height, median_height * 1.15)
-            estimated_natural_width = (
-                _text_character_units(display_text)
-                * estimated_line_height
-                * (0.95 if is_title else 0.72)
+        style = line.style or {}
+        bold = bool(
+            style.get(
+                "bold",
+                is_title
+                or inferred_bold,
             )
-            width_rows = max(
-                1,
-                math.ceil(estimated_natural_width / max(1.0, box_width * 1.03)),
+        )
+        italic = bool(style.get("italic", inferred_italic))
+        typeface = _typeface_for_text(display_text, font_name, style)
+        font_size_px = _font_size_for_box(
+            display_text,
+            row_box,
+            typeface=typeface,
+            bold=bold,
+            italic=italic,
+        )
+        alignment_hint = str(style.get("align", "")).strip().casefold()
+        centered = not has_bullet and (
+            alignment_hint == "center"
+            or (
+                not alignment_hint
+                and left_anchor_counts.get(id(line), 1) < 3
+                and abs(((line_x1 + line_x2) * 0.5) - width * 0.5)
+                < width * 0.075
+                and line_x1 > width * 0.06
+                and line_x2 < width * 0.94
             )
-            height_rows = max(
-                1,
-                round(box_height / max(1.0, estimated_line_height * 0.88)),
+        )
+        pad_x = max(1.0, box_height * 0.045)
+        pad_y = max(1.0, box_height * 0.10)
+        text_x = max(safe_x, x1 - pad_x)
+        text_y = max(safe_y, y1 - pad_y)
+        text_width = min(float(width) - safe_x - text_x, box_width + pad_x * 2.0)
+        text_height = min(
+            float(height) - safe_y - text_y,
+            box_height + pad_y * 2.0,
+        )
+        local_color = _hex_from_bgr(
+            _row_foreground_color(
+                source,
+                ink_mask,
+                row_box,
+                analysis.foreground_bgr,
             )
-            inferred_rows = min(8, width_rows, height_rows)
-            display_text = _wrap_text_for_rows(display_text, inferred_rows)
-            text_rows = [
-                row for row in display_text.splitlines() if row.strip()
-            ] or [display_text]
-        row_count = len(text_rows)
-        height_font_size = float(
-            np.clip(box_height * target_scale * 0.70 / row_count, 6.0, 52.0)
         )
-        centered = (
-            abs(((x1 + x2) * 0.5) - width * 0.5) < width * 0.075
-            and x1 > width * 0.06
-            and x2 < width * 0.94
-        )
-        extra_width = max(box_height * 0.45, box_width * 0.10)
-        character_units = max(
-            _text_character_units(row)
-            for row in text_rows
-        )
-        if centered:
-            center = (x1 + x2) * 0.5
-            available_source_width = max(
-                2.0,
-                min(center - safe_x, width - safe_x - center) * 2.0,
-            )
-        else:
-            source_x = max(safe_x, x1 - box_height * 0.08)
-            available_source_width = max(2.0, width - safe_x - source_x)
-        width_font_size = (
-            available_source_width * target_scale
-            / max(1.0, character_units * (96.0 / 72.0))
-            * 0.97
-        )
-        font_size = float(np.clip(min(height_font_size, width_font_size), 6.0, 52.0))
-        estimated_source_width = (
-            character_units
-            * font_size
-            * (96.0 / 72.0)
-            / max(target_scale, 1e-6)
-            * 1.04
-        )
-        desired_width = max(box_width + extra_width, estimated_source_width)
-        if centered:
-            center = (x1 + x2) * 0.5
-            text_x = max(safe_x, center - desired_width * 0.5)
-            text_width = min(float(width) - safe_x - text_x, desired_width)
-        else:
-            text_x = max(safe_x, x1 - box_height * 0.08)
-            text_width = min(float(width) - safe_x - text_x, desired_width)
-        text_y = max(safe_y, y1 - box_height * 0.18)
-        text_height = min(float(height) - safe_y - text_y, box_height * 1.46)
+        source_color = _valid_hex_color(style.get("color")) or local_color
+        source_color = _readable_text_color(source_color, analysis.background_bgr)
+        align = str(style.get("align", "center" if centered else "left"))
+        if align not in {"left", "center", "right", "justify"}:
+            align = "center" if centered else "left"
+        if has_bullet and "align" not in style:
+            align = "left"
         specs.append(
             {
                 "name": f"text-{index:03d}",
@@ -1132,23 +2265,36 @@ def _clean_text_and_build_specs(
                 "y": round(text_y, 2),
                 "w": round(max(2.0, text_width), 2),
                 "h": round(max(2.0, text_height), 2),
-                "fontSize": round(font_size, 2),
-                "fontSizePt": round(font_size, 2),
-                "color": _hex_from_bgr(analysis.foreground_bgr),
-                "bold": bool(
-                    is_title
-                    or box_height >= median_height * 1.45
-                    or (centered and y1 < height * 0.38 and box_height >= median_height * 1.06)
-                ),
-                "align": "center" if centered else "left",
+                "fontSize": round(font_size_px, 2),
+                "fontSizePt": round(font_size_px * 72.0 / 96.0, 2),
+                "color": source_color,
+                "bold": bold,
+                "italic": italic,
+                "align": align,
                 "valign": "middle",
-                "typeface": font_name,
+                "typeface": typeface,
                 "rotation": round(_text_rotation(line), 2),
                 "confidence": round(line.confidence, 4),
                 "analysisLabel": line.label,
+                "needsReview": bool(
+                    style.get("uncertain", False)
+                    or style.get("editable") is False
+                ),
             }
         )
-    _constrain_same_row_text_specs(lines, specs, width, height, target_scale)
+        spec_lines.append(
+            OCRLine(
+                np.asarray(
+                    [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                    dtype=np.float32,
+                ),
+                display_text,
+                line.confidence,
+                line.label,
+                line.style,
+            )
+        )
+    _constrain_same_row_text_specs(spec_lines, specs, width, height, 1.0)
     return cleaned, full_mask, specs
 
 
@@ -1159,7 +2305,7 @@ def _constrain_same_row_text_specs(
     height: int,
     target_scale: float,
 ) -> None:
-    del height
+    del height, target_scale
     for index, (line, spec) in enumerate(zip(lines, specs)):
         x1, y1, x2, y2 = line.bbox
         line_height = max(1, y2 - y1)
@@ -1188,27 +2334,18 @@ def _constrain_same_row_text_specs(
         original_left = max(0.0, x1 - line_height * 0.08)
         text_x = max(float(spec["x"]), left_boundary, original_left)
         available_width = max(2.0, right_boundary - text_x)
+        original_width = max(2.0, float(spec["w"]))
         spec["x"] = round(text_x, 2)
-        spec["w"] = round(min(float(spec["w"]), available_width), 2)
+        spec["w"] = round(min(original_width, available_width), 2)
         spec["align"] = "left"
 
-        character_units = max(
-            (
-                _text_character_units(row)
-                for row in str(spec["text"]).splitlines()
-                if row.strip()
-            ),
-            default=1.0,
-        )
-        width_font_size = (
-            float(spec["w"])
-            * target_scale
-            / max(1.0, character_units * (96.0 / 72.0))
-            * 0.96
-        )
-        font_size = float(np.clip(min(float(spec["fontSize"]), width_font_size), 6.0, 52.0))
-        spec["fontSize"] = round(font_size, 2)
-        spec["fontSizePt"] = round(font_size, 2)
+        if float(spec["w"]) < original_width:
+            scale = float(spec["w"]) / original_width
+            spec["fontSize"] = round(max(8.0, float(spec["fontSize"]) * scale), 2)
+            spec["fontSizePt"] = round(
+                max(6.0, float(spec["fontSizePt"]) * scale),
+                2,
+            )
 
 
 def _ring_pixels(
@@ -1584,6 +2721,85 @@ def _line_is_covered_by_asset(line: OCRLine, asset: dict[str, Any]) -> bool:
     return intersection_width * intersection_height / line_area >= 0.58
 
 
+def _text_spec_is_covered_by_asset(
+    spec: dict[str, Any],
+    asset: dict[str, Any],
+) -> bool:
+    x1 = float(spec["x"])
+    y1 = float(spec["y"])
+    x2 = x1 + float(spec["w"])
+    y2 = y1 + float(spec["h"])
+    ax1 = float(asset["x"])
+    ay1 = float(asset["y"])
+    ax2 = ax1 + float(asset["w"])
+    ay2 = ay1 + float(asset["h"])
+    intersection_width = max(0.0, min(x2, ax2) - max(x1, ax1))
+    intersection_height = max(0.0, min(y2, ay2) - max(y1, ay1))
+    area = max(1.0, (x2 - x1) * (y2 - y1))
+    return intersection_width * intersection_height / area >= 0.58
+
+
+def _dense_review_text_ids(
+    review_lines: list[OCRLine],
+    width: int,
+    height: int,
+) -> set[int]:
+    """Promote coherent long-form OCR when image patches would fragment a page."""
+
+    candidates = [
+        line
+        for line in review_lines
+        if line.label == "text"
+        and line.confidence >= 0.50
+        and len(line.text.strip()) >= 200
+    ]
+    if len(candidates) < 2:
+        return set()
+
+    coverage = np.zeros((height, width), dtype=np.uint8)
+    for line in candidates:
+        x1, y1, x2, y2 = _clip_bbox(line.bbox, width, height)
+        coverage[y1:y2, x1:x2] = 1
+    if float(np.mean(coverage)) < 0.20:
+        return set()
+    return {id(line) for line in candidates}
+
+
+def _dense_text_panel_bbox(
+    lines: list[OCRLine],
+    promoted_line_ids: set[int],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int] | None:
+    if not promoted_line_ids:
+        return None
+    promoted = [line for line in lines if id(line) in promoted_line_ids]
+    anchor_x1 = min(line.bbox[0] for line in promoted)
+    anchor_x2 = max(line.bbox[2] for line in promoted)
+    panel_lines = []
+    for line in lines:
+        if line.label not in {"text", "paragraph_title"}:
+            continue
+        x1, _, x2, _ = line.bbox
+        overlap = max(0, min(anchor_x2, x2) - max(anchor_x1, x1))
+        if overlap / max(1, x2 - x1) >= 0.60:
+            panel_lines.append(line)
+    if not panel_lines:
+        return None
+    pad_x = max(8, int(round(width * 0.008)))
+    pad_y = max(6, int(round(height * 0.010)))
+    return _clip_bbox(
+        (
+            min(line.bbox[0] for line in panel_lines) - pad_x,
+            min(line.bbox[1] for line in panel_lines) - pad_y,
+            max(line.bbox[2] for line in panel_lines) + pad_x,
+            max(line.bbox[3] for line in panel_lines) + pad_y,
+        ),
+        width,
+        height,
+    )
+
+
 def _reconstruct_slide(
     image_path: Path,
     slide_number: int,
@@ -1594,6 +2810,7 @@ def _reconstruct_slide(
         | AutoOCREngine
         | PPStructureV3Engine
         | PaddleOCRVLEngine
+        | OpenAIVisionEngine
         | None
     ),
     min_text_confidence: float,
@@ -1602,6 +2819,7 @@ def _reconstruct_slide(
     image = cv2.imread(str(image_path))
     if image is None:
         raise ValueError(f"Could not read slide image: {image_path}")
+    text_analysis_image = image.copy()
     height, width = image.shape[:2]
     slide_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1621,12 +2839,156 @@ def _reconstruct_slide(
         raise RuntimeError("OCR engine is required for editable modes")
     ocr_input = (
         image
-        if isinstance(ocr_engine, (PPStructureV3Engine, PaddleOCRVLEngine))
+        if isinstance(
+            ocr_engine,
+            (PPStructureV3Engine, PaddleOCRVLEngine, OpenAIVisionEngine),
+        )
         else prepare_ocr_image(image).image
     )
     lines = ocr_engine.recognize(ocr_input, min_text_confidence)
     layout_regions = list(getattr(ocr_engine, "last_layout_regions", []))
-    cleaned, text_mask, text_specs = _clean_text_and_build_specs(image, lines, font_name)
+    image = descreen_presentation_image(
+        image,
+        excluded_boxes=[
+            *(line.bbox for line in lines),
+            *(
+                _clip_bbox(region["bbox"], width, height)
+                for region in layout_regions
+                if float(region.get("score", 0.0)) >= 0.30
+            ),
+            *(
+                _clip_bbox(tuple(region["bbox"]), width, height)
+                for region in list(getattr(ocr_engine, "last_occlusions", []))
+            ),
+        ],
+    )
+    model_forced_occlusions = [
+        _clip_bbox(tuple(region["bbox"]), width, height)
+        for region in list(getattr(ocr_engine, "last_occlusions", []))
+        if float(region.get("confidence", 0.0)) >= 0.55
+    ]
+    edge_capture_occlusions = []
+    for region in layout_regions:
+        if region.get("label") != "image":
+            continue
+        score = float(region.get("score", 0.0))
+        bbox = _clip_bbox(region["bbox"], width, height)
+        x1, _, x2, y2 = bbox
+        weak_edge_image = (
+            0.20 <= score < 0.40
+            and (x1 <= 1 or x2 >= width - 1)
+            and x2 - x1 <= width * 0.14
+            and y2 >= height * 0.65
+        )
+        if weak_edge_image:
+            horizontal_pad = int(round(width * 0.06))
+            vertical_pad = int(round(height * 0.06))
+            if x1 <= 1:
+                bbox = (
+                    0,
+                    max(0, bbox[1] - vertical_pad),
+                    min(width, bbox[2] + horizontal_pad),
+                    min(height, bbox[3] + vertical_pad),
+                )
+            else:
+                bbox = (
+                    max(0, bbox[0] - horizontal_pad),
+                    max(0, bbox[1] - vertical_pad),
+                    width,
+                    min(height, bbox[3] + vertical_pad),
+                )
+            edge_capture_occlusions.append(bbox)
+    merged_edge_occlusions: list[tuple[int, int, int, int]] = []
+    for bbox in sorted(edge_capture_occlusions, key=lambda item: (item[0], item[1])):
+        if merged_edge_occlusions:
+            previous = merged_edge_occlusions[-1]
+            same_edge = (
+                previous[0] == bbox[0] == 0
+                or previous[2] == bbox[2] == width
+            )
+            if same_edge and bbox[1] <= previous[3] + height * 0.12:
+                merged_edge_occlusions[-1] = (
+                    min(previous[0], bbox[0]),
+                    min(previous[1], bbox[1]),
+                    max(previous[2], bbox[2]),
+                    max(previous[3], bbox[3]),
+                )
+                continue
+        merged_edge_occlusions.append(bbox)
+    edge_capture_occlusions = merged_edge_occlusions
+    forced_occlusions = list(
+        dict.fromkeys([*model_forced_occlusions, *edge_capture_occlusions])
+    )
+    protected_boxes = [line.bbox for line in lines]
+    for region in layout_regions:
+        score = float(region.get("score", 0.0))
+        if region.get("label") not in VISUAL_LAYOUT_LABELS or score < 0.40:
+            continue
+        bbox = _clip_bbox(region["bbox"], width, height)
+        x1, y1, x2, y2 = bbox
+        overlaps_forced = any(
+            _bbox_overlap_fraction(forced_box, bbox) >= 0.30
+            for forced_box in forced_occlusions
+        )
+        if not overlaps_forced:
+            protected_boxes.append(bbox)
+    occlusion_repair = repair_border_occlusions(
+        image,
+        protected_boxes=protected_boxes,
+        forced_boxes=model_forced_occlusions,
+        solid_forced_boxes=edge_capture_occlusions,
+    )
+    working_image = occlusion_repair.image
+
+    editable_lines = [
+        line
+        for line in lines
+        if line.confidence >= min_text_confidence
+        and not bool((line.style or {}).get("uncertain", False))
+        and (line.style or {}).get("editable") is not False
+    ]
+    editable_line_ids = {id(line) for line in editable_lines}
+    initial_review_lines = [line for line in lines if id(line) not in editable_line_ids]
+    promoted_line_ids = _dense_review_text_ids(
+        initial_review_lines,
+        width,
+        height,
+    )
+    if promoted_line_ids:
+        editable_lines = [
+            line
+            for line in lines
+            if id(line) in editable_line_ids or id(line) in promoted_line_ids
+        ]
+        editable_line_ids = {id(line) for line in editable_lines}
+    review_lines = [line for line in lines if id(line) not in editable_line_ids]
+    dense_panel_bbox = _dense_text_panel_bbox(
+        lines,
+        promoted_line_ids,
+        width,
+        height,
+    )
+    cleaning_lines = lines if mode == "editable" else editable_lines
+    cleaned, text_mask, text_specs = _clean_text_and_build_specs(
+        working_image,
+        cleaning_lines,
+        font_name,
+        analysis_image=text_analysis_image,
+    )
+    if mode == "editable":
+        text_specs = [
+            spec
+            for spec in text_specs
+            if (
+                float(spec.get("confidence", 0.0)) >= min_text_confidence
+                and not bool(spec.get("needsReview", False))
+            )
+            or (
+                dense_panel_bbox is not None
+                and spec.get("analysisLabel") == "text"
+                and float(spec.get("confidence", 0.0)) >= 0.50
+            )
+        ]
     shape_specs: list[dict[str, Any]] = []
     image_specs: list[dict[str, Any]] = []
     background = cleaned
@@ -1636,7 +2998,7 @@ def _reconstruct_slide(
             _clip_bbox(region["bbox"], width, height)
             for region in layout_regions
             if region.get("label") in VISUAL_LAYOUT_LABELS
-            and float(region.get("score", 0.0)) >= 0.45
+            and float(region.get("score", 0.0)) >= 0.30
         ]
         complex_regions = _merge_boxes(
             [*_complex_visual_regions(lines, width, height), *structure_boxes],
@@ -1646,21 +3008,45 @@ def _reconstruct_slide(
         background, image_specs = _extract_visual_assets(
             without_shapes,
             slide_dir / "assets",
-            crop_source=image,
-            forced_boxes=complex_regions,
+            crop_source=working_image,
+            forced_boxes=[*complex_regions, *(line.bbox for line in review_lines)],
         )
+        background = normalize_nearly_solid_background(background)
+        if dense_panel_bbox is not None:
+            panel_x1, panel_y1, panel_x2, panel_y2 = dense_panel_bbox
+            panel_fill = np.median(background.reshape(-1, 3), axis=0).astype(np.uint8)
+            shape_specs.append(
+                {
+                    "name": f"quality-panel-{slide_number:02d}",
+                    "kind": "rect",
+                    "x": panel_x1,
+                    "y": panel_y1,
+                    "w": panel_x2 - panel_x1,
+                    "h": panel_y2 - panel_y1,
+                    "fill": _hex_from_bgr(panel_fill),
+                    "line": "#00000000",
+                    "lineWidth": 0.0,
+                }
+            )
         if image_specs:
             text_specs = [
                 spec
-                for line, spec in zip(lines, text_specs)
-                if not any(_line_is_covered_by_asset(line, asset) for asset in image_specs)
+                for spec in text_specs
+                if not any(
+                    _text_spec_is_covered_by_asset(spec, asset)
+                    for asset in image_specs
+                )
             ]
 
     background_path = slide_dir / "background.png"
     mask_path = slide_dir / "text-mask.png"
+    occlusion_mask_path = slide_dir / "occlusion-mask.png"
+    repaired_path = slide_dir / "capture-restored.png"
     overlay_path = slide_dir / "ocr-overlay.png"
     _write_image(background_path, background)
     _write_image(mask_path, text_mask)
+    _write_image(occlusion_mask_path, occlusion_repair.mask)
+    _write_image(repaired_path, working_image)
     _write_image(overlay_path, _slide_debug_overlay(image, lines))
 
     ocr_json = {
@@ -1669,6 +3055,26 @@ def _reconstruct_slide(
         "layoutRegions": layout_regions,
         "visionModel": getattr(ocr_engine, "model_name", None),
         "visionBlocks": list(getattr(ocr_engine, "last_blocks", [])),
+        "backgroundAnalysis": dict(
+            getattr(ocr_engine, "last_background_analysis", {})
+        ),
+        "occlusions": [
+            {
+                "bbox": list(bbox),
+                "source": "model"
+                if any(
+                    _bbox_overlap_fraction(bbox, forced_box) >= 0.30
+                    for forced_box in model_forced_occlusions
+                )
+                else "low-confidence-edge-visual"
+                if any(
+                    _bbox_overlap_fraction(bbox, forced_box) >= 0.30
+                    for forced_box in edge_capture_occlusions
+                )
+                else "conservative-border-detector",
+            }
+            for bbox in occlusion_repair.regions
+        ],
         "lines": [
             {
                 "text": line.text,
@@ -1676,6 +3082,9 @@ def _reconstruct_slide(
                 "label": line.label,
                 "polygon": line.polygon.tolist(),
                 "bbox": list(line.bbox),
+                "style": line.style,
+                "editable": id(line) in editable_line_ids,
+                "needsReview": id(line) not in editable_line_ids,
             }
             for line in lines
         ],
@@ -1703,6 +3112,12 @@ def _reconstruct_slide(
         "analysisEngine": type(ocr_engine).__name__,
         "visionModel": getattr(ocr_engine, "model_name", None),
         "layoutRegionCount": len(layout_regions),
+        "needsReviewTextCount": len(review_lines),
+        "promotedReviewTextCount": len(promoted_line_ids),
+        "renderStrategy": "dense-text-rebuild"
+        if dense_panel_bbox is not None
+        else "editable",
+        "occlusionRepairCount": len(occlusion_repair.regions),
         "meanTextConfidence": round(float(np.mean([line.confidence for line in lines])), 4)
         if lines
         else None,
@@ -1773,6 +3188,11 @@ def _run_pptx_builder(
         raise RuntimeError(f"PPTX builder failed: {detail}")
     if not temporary.is_file() or temporary.stat().st_size == 0:
         raise RuntimeError(f"PPTX builder did not create a valid file: {temporary}")
+    inspect_sidecar = Path(f"{temporary}.inspect.ndjson")
+    if inspect_sidecar.is_file():
+        inspect_target = work_dir / "artifact-workspace" / "pptx-inspect.ndjson"
+        inspect_target.parent.mkdir(parents=True, exist_ok=True)
+        inspect_sidecar.replace(inspect_target)
     temporary.replace(output_path)
 
 
@@ -1784,13 +3204,14 @@ def build_editable_pptx(
     analysis_engine: str = "vlm",
     ocr_language: str = "auto",
     ocr_device: str = "auto",
-    min_text_confidence: float = 0.78,
+    min_text_confidence: float = 0.70,
     font_name: str = "Microsoft YaHei",
+    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
     work_dir: Path | None = None,
 ) -> Path:
     if mode not in {"editable", "hybrid", "image"}:
         raise ValueError(f"Unsupported PPT mode: {mode}")
-    if analysis_engine not in {"vlm", "ocr", "structure"}:
+    if analysis_engine not in {"vlm", "openai", "ocr", "structure"}:
         raise ValueError(f"Unsupported analysis engine: {analysis_engine}")
     if not image_paths:
         raise ValueError("No slide images were provided")
@@ -1800,7 +3221,7 @@ def build_editable_pptx(
     reconstruction_dir = (
         Path(work_dir).expanduser().resolve()
         if work_dir
-        else output_path.parent / "intermediate" / "reconstruction"
+        else DEFAULT_RECONSTRUCTION_DIR
     )
     reconstruction_dir.mkdir(parents=True, exist_ok=True)
     if mode == "image":
@@ -1809,10 +3230,13 @@ def build_editable_pptx(
             | AutoOCREngine
             | PPStructureV3Engine
             | PaddleOCRVLEngine
+            | OpenAIVisionEngine
             | None
         ) = None
     elif analysis_engine == "vlm":
         ocr_engine = PaddleOCRVLEngine(ocr_device)
+    elif analysis_engine == "openai":
+        ocr_engine = OpenAIVisionEngine(vision_model)
     elif analysis_engine == "structure":
         ocr_engine = PPStructureV3Engine(ocr_language, ocr_device)
     elif ocr_language == "auto":

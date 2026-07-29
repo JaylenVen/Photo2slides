@@ -1,15 +1,17 @@
 # photo2slide
 
-把会议现场拍摄的幻灯片照片转换为分层、可继续编辑的 PPTX。默认流程只使用本地视觉语言模型 PaddleOCR‑VL 1.6 做页面理解，不使用 DeepSeek，也不需要 API Key。VLM 与版面模型统一运行在官方 Transformers/PyTorch 后端。
+把会议现场拍摄的幻灯片照片转换为分层、可继续编辑的 PPTX。默认流程只使用本地视觉语言模型 PaddleOCR‑VL 1.6 做页面理解，不需要 API Key；需要更强的小字、样式和遮挡判断时，可切换到 OpenAI 高精度视觉模型。
 
 ## 默认流程
 
 1. YOLO 分割模型定位照片中的投影屏幕。
-2. 根据分割掩膜拟合四边形，完成透视校正、颜色与清晰度增强。
-3. PaddleOCR‑VL 1.6 直接读取校正后的整页图像，识别标题、正文、图片、图表、表格和公式区域。
-4. 高置信文本重建为原生 PPT 文本框；简单矩形重建为原生形状。
-5. 图表、公式、照片和复杂示意图保留为独立可移动的图片对象。
-6. 从背景中移除已重建文字，再由 Artifact Tool 写入 PPTX，并逐页生成预览和布局检查文件。
+2. 根据分割掩膜拟合四边形，完成透视校正。
+3. 修正投影光照与色偏，抑制密集横/竖向摩尔纹，并保守修补人物、讲台等边缘遮挡。
+4. 视觉模型读取恢复后的整页图像，识别标题、正文、图片、图表、表格、公式和前景遮挡。
+5. 高置信文本按实际逐行字形框重建，恢复位置、字号、颜色、粗斜体和对齐；简单矩形重建为原生形状。
+6. 图表、公式、照片和复杂示意图保留为独立可移动的图片对象。
+7. 从背景中完整移除已重建文字；低置信文字以原图块保留，避免背景残字和错误转写同时出现。
+8. 由 Node.js 写入 PPTX；普通环境使用 `pptxgenjs`，检测到 Codex presentations artifact runtime 时会额外生成逐页预览和布局检查文件。
 
 这是一种“可编辑文字 + 保真视觉块”的混合重建。它不会把被人物、讲台或弹窗完全挡住的像素伪造为真实内容。
 
@@ -19,13 +21,17 @@
 p2p/
 ├─ data/
 │  ├─ input/                 # 原始照片
-│  ├─ cache/                 # 首次运行下载的官方模型缓存
-│  ├─ output/                # 最终 PPTX 与验收报告
-│  ├─ work/latest/           # 最近一次运行的中间结果和逐页预览
-│  └─ archive/               # 旧结果归档
+│  ├─ final/                 # 所有历次最终 PPTX
+│  └─ intermediate/
+│     ├─ cache/              # 模型与下载缓存
+│     ├─ runs/latest/        # 默认中间结果
+│     ├─ qa/                 # 成品渲染与审查报告
+│     └─ archive/            # 旧版中间资料
+├─ models/                   # 运行时 YOLO 推理权重
 ├─ src/                      # 主流程与 PPTX 构建器
-├─ tests/                    # 单元测试
-└─ requirements-vision.txt
+├─ tests/                    # 本地测试（Git 忽略，不上传）
+├─ training/                 # 本地训练资料（Git 忽略，不参与日常运行）
+└─ requirements.txt
 ```
 
 ## 安装
@@ -33,7 +39,7 @@ p2p/
 以下命令在仓库根目录执行：
 
 ```powershell
-D:\Anaconda\envs\p2p\python.exe -m pip install -r p2p\requirements-vision.txt
+D:\Anaconda\envs\p2p\python.exe -m pip install -r p2p\requirements.txt
 ```
 
 默认流程依赖 PyTorch。使用 NVIDIA GPU 时，可先确认当前 PyTorch 能看到 CUDA：
@@ -52,12 +58,12 @@ npm install
 Set-Location ..\..
 ```
 
-PaddleOCR‑VL 和版面模型会在第一次运行时从官方 ModelScope 仓库自动下载到 `p2p\data\cache\paddlex`，后续运行直接复用。
+PaddleOCR‑VL 和版面模型会在第一次运行时下载到 `p2p\data\intermediate\cache`，后续运行直接复用。
 
 ## 手动跑完整流程
 
 1. 把照片放入 `p2p\data\input`。文件名按自然数字顺序排序，例如 `1.jpg`、`2.png`、`10.jpg`。
-2. 确认 YOLO 权重存在：`yolo26\runs\segment\slide_seg_9_1\weights\best.pt`。
+2. 确认默认 YOLO 权重存在：`p2p\models\slide-seg.pt`。
 3. 在仓库根目录运行：
 
 ```powershell
@@ -73,14 +79,25 @@ D:\Anaconda\envs\p2p\python.exe p2p\src\photo_to_pptx.py `
 D:\Anaconda\envs\p2p\python.exe p2p\src\photo_to_pptx.py
 ```
 
+如需使用高精度 OpenAI 视觉理解：
+
+```powershell
+$env:OPENAI_API_KEY = "..."
+D:\Anaconda\envs\p2p\python.exe p2p\src\photo_to_pptx.py `
+  --analysis-engine openai `
+  --vision-model gpt-5.6
+```
+
+OpenAI 模式会上传透视校正后的幻灯片图像，并产生 API 费用。敏感材料请继续使用默认本地模式。
+
 成功后查看：
 
-- 最终文件：`p2p\data\output\photo2slide-vlm.pptx`
-- 验收报告：`p2p\data\output\qa-report.txt`
-- 最终渲染：`p2p\data\output\qa\rendered`
-- 逐页预览：`p2p\data\work\latest\reconstruction\preview`
-- 页面识别结果：`p2p\data\work\latest\reconstruction\slide-XX\ocr.json`
-- 整体统计：`p2p\data\work\latest\reconstruction\reconstruction-summary.json`
+- 最终文件：`p2p\data\final\photo2slide-vlm.pptx`
+- 页面识别结果：`p2p\data\intermediate\runs\latest\reconstruction\slide-XX\ocr.json`
+- 整体统计：`p2p\data\intermediate\runs\latest\reconstruction\reconstruction-summary.json`
+- 构建信息：`p2p\data\intermediate\runs\latest\reconstruction\artifact-workspace\build-manifest.json`
+
+普通环境不会自动生成验收报告。仅在检测到 Codex presentations artifact runtime 时，才会额外生成 `preview`、`layout` 和 `inspect.ndjson`。
 
 ## 常用参数
 
@@ -90,6 +107,9 @@ D:\Anaconda\envs\p2p\python.exe p2p\src\photo_to_pptx.py --analysis-device gpu
 
 # 只生成整页图片型 PPT，用于快速检查分割和透视校正
 D:\Anaconda\envs\p2p\python.exe p2p\src\photo_to_pptx.py --ppt-mode image
+
+# 调整转为可编辑文字的最低置信度；默认 0.70
+D:\Anaconda\envs\p2p\python.exe p2p\src\photo_to_pptx.py --ocr-conf 0.75
 
 # 指定输入、输出和中间目录
 D:\Anaconda\envs\p2p\python.exe p2p\src\photo_to_pptx.py `
@@ -103,13 +123,17 @@ D:\Anaconda\envs\p2p\python.exe p2p\src\photo_to_pptx.py `
 - 标题、正文、页码等文本：原生文本框。
 - 高置信简单矩形：原生形状。
 - 图表、公式、复杂示意图和照片：独立图片对象，可移动、裁剪、缩放或替换。
-- 完全遮挡的区域：无法从单张照片真实恢复；项目不会把模型猜测伪装成原稿。
-- 超分辨率只能改善观感和模型输入，不能保证恢复真实小字、图表数值或原始高清素材。
+- 人物或讲台遮住的纯背景：根据邻近颜色和纹理近似补齐。
+- 完全遮住的文字、图表数值或图像细节：无法从单张照片真实恢复；项目不会把模型猜测伪装成原稿。
+- 模糊小字：视觉模型可给出最佳可见读法；低置信或不确定内容保留为图片，并在 `ocr.json` 中标为 `needsReview`。
+- 未知或未安装的定制字体：使用最接近的已安装字体，因此无法保证字面宽度绝对一致。
 
-## 验证
+## 本地维护验证
 
 ```powershell
 D:\Anaconda\envs\p2p\python.exe -m unittest discover -s p2p\tests -v
 ```
 
-PPTX 生成后还应检查 `preview` 中的每一页，并运行 Presentations 工具自带的越界检查；不能只凭程序成功退出判断版式合格。
+`p2p\tests` 按项目要求只保留在维护者本地工作区，不上传到 GitHub。PPTX 生成后应在 PowerPoint 中逐页检查；若当前环境生成了 `preview`，也应检查每一张预览，不能只凭程序成功退出判断版式合格。
+
+面向首次使用者的完整安装、运行、产物检查和故障排查说明见仓库根目录的 `README.md`。
